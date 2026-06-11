@@ -93,34 +93,61 @@ def _today() -> date:
 
 
 # ---- response shape handling ----------------------------------------------
+def _unwrap(chain: dict) -> dict:
+    """PentPort nests the chain under a 'chain' key; unwrap to that dict."""
+    if isinstance(chain, dict) and isinstance(chain.get("chain"), dict):
+        return chain["chain"]
+    return chain
+
+
 def _iter_contracts(chain: dict):
-    """Yield raw contract dicts from whatever shape the chain takes."""
-    # 1) TDA / Schwab style nested maps
-    for map_key in ("putExpDateMap", "callExpDateMap", "put_exp_date_map", "call_exp_date_map"):
+    """Yield (contract_dict, right_hint) from whatever shape the chain takes.
+
+    right_hint is 'P'/'C' inferred from the put/call map (real PentPort contracts
+    don't carry putCall on the contract itself), or None for flat lists where the
+    contract should declare its own right.
+    """
+    chain = _unwrap(chain)
+
+    # 1) Nested maps: {exp: {strike: [contracts]}} (TDA) OR {exp: [contracts]} (PentPort)
+    for map_key, hint in (("putExpDateMap", "P"), ("callExpDateMap", "C"),
+                          ("put_exp_date_map", "P"), ("call_exp_date_map", "C")):
         m = chain.get(map_key) if isinstance(chain, dict) else None
-        if isinstance(m, dict):
-            for _exp, strikes in m.items():
-                if isinstance(strikes, dict):
-                    for _k, contracts in strikes.items():
-                        if isinstance(contracts, list):
-                            yield from (c for c in contracts if isinstance(c, dict))
-                        elif isinstance(contracts, dict):
-                            yield contracts
+        if not isinstance(m, dict):
+            continue
+        for _exp, val in m.items():
+            if isinstance(val, dict):
+                for _k, contracts in val.items():
+                    if isinstance(contracts, list):
+                        for c in contracts:
+                            if isinstance(c, dict):
+                                yield c, hint
+                    elif isinstance(contracts, dict):
+                        yield contracts, hint
+            elif isinstance(val, list):
+                for c in val:
+                    if isinstance(c, dict):
+                        yield c, hint
 
     # 2) split lists
-    for key in ("calls", "puts"):
+    for key, hint in (("calls", "C"), ("puts", "P")):
         lst = chain.get(key) if isinstance(chain, dict) else None
         if isinstance(lst, list):
-            yield from (c for c in lst if isinstance(c, dict))
+            for c in lst:
+                if isinstance(c, dict):
+                    yield c, hint
 
-    # 3) flat list under a variety of keys
-    for key in ("options", "chain", "contracts", "data", "results"):
+    # 3) flat list under a variety of keys (contract declares its own right)
+    for key in ("options", "contracts", "data", "results"):
         lst = chain.get(key) if isinstance(chain, dict) else None
         if isinstance(lst, list):
-            yield from (c for c in lst if isinstance(c, dict))
+            for c in lst:
+                if isinstance(c, dict):
+                    yield c, None
 
 
 def underlying_price(chain: dict) -> Optional[float]:
+    chain = _unwrap(chain)
     for k in ("underlyingPrice", "underlying_price", "underlyingLast", "last", "mark", "spot"):
         v = _num(chain.get(k)) if isinstance(chain, dict) else None
         if v:
@@ -157,8 +184,8 @@ def normalize(chain: dict, underlying: str, spot: Optional[float] = None) -> lis
     r = config.RISK_FREE_RATE
 
     out: list[NormOption] = []
-    for c in _iter_contracts(chain):
-        right = _norm_right(_first(c, "putCall", "type", "right", "option_type", "side"))
+    for c, right_hint in _iter_contracts(chain):
+        right = _norm_right(_first(c, "putCall", "type", "right", "option_type", "side")) or right_hint
         strike = _num(_first(c, "strikePrice", "strike", "strike_price", "K"))
         if right is None or strike is None:
             continue
