@@ -23,6 +23,7 @@ import sys
 
 from pp_options import config
 from pp_options.engine import run_once
+from pp_options.envload import load_env
 from pp_options.logutil import setup_logging
 
 
@@ -32,6 +33,7 @@ def main() -> int:
                         help="use synthetic offline data (no API key / network)")
     args = parser.parse_args()
 
+    load_env()  # load .env into os.environ (no-op if absent; real env vars win)
     logger, path = setup_logging(tag="mock" if args.mock else "dryrun")
     if config.LIVE_TRADING:
         logger.warning("LIVE_TRADING is TRUE -- real orders will be submitted if they pass guardrails.")

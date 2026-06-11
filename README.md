@@ -125,22 +125,68 @@ filter) and the VIX series come from **Yahoo Finance's public chart endpoint**
 read-only and never used for trading. Swap `_fetch()` there for any other
 provider — the rest of the system only depends on the `DailySeries` contract.
 
+## Adaptive sizing layer (risk management, not alpha)
+
+An optional layer that adjusts sizing/strike-delta to manage **risk** — it can
+only ever make the book **equal-or-more conservative** than the base rules, and
+the 3%/20% hard caps are checked *after* it and override it.
+
+- **Interpretable regime classifier** (`pp_options/regime_model.py`): a
+  transparent rules-based label (`CALM/NORMAL/ELEVATED/STRESS`) from VIX level,
+  VIX term structure (VIX/VIX3M backwardation), and trailing realized vol. The
+  only *fitted* parameters are VIX/realized-vol **quantile thresholds** estimated
+  on a past window; the regime→policy map is a **fixed defensive table**, never
+  optimized against P/L. It predicts *regime*, never returns.
+- **What it may adjust (within hard limits only):** a size multiplier in
+  `[0,1]` (never > 1.0), short-leg delta in `[0.20, 0.30]` (never closer than
+  0.30), and a skip decision. `clamp_to_base()` guarantees the output is ≤ the
+  base rule on every axis — proven over 2,000 randomized inputs in tests.
+
+### Walk-forward validation (required before trusting it)
+
+```bash
+python walkforward.py                       # rolling 3y train / 6mo test / 6mo step
+python walkforward.py --expanding --range 10y --cadence 21   # stress-test windows
+```
+
+Trains thresholds on a past window, tests on **strictly future unseen** data,
+rolls forward (no lookahead in fitting or regime labels). Reports, per-fold and
+aggregated, **adaptive vs static (model-off) side-by-side** for every metric:
+CAGR, max drawdown, worst trade, worst day, 95%/99% loss, hit rate, avg win/loss,
+and Sharpe/Sortino (flagged *secondary* — they flatter short premium until the
+tail). Folds with **<30 trades are labeled LOW-CONFIDENCE** and excluded from
+means. The adaptive-minus-static return difference gets a **bootstrap 95% CI +
+permutation p-value**; the verdict is allowed to say *"no demonstrable edge."*
+**Model-decay detection** flags persistent vol > forecast regime, a pinned
+multiplier, or OOS drawdown beyond the worst prior fold, and prints retrain
+cadence + triggers.
+
+Current result (modeled options, 2018–2026): de-risked in 7/10 folds, **cut the
+2022 bear-market drawdown from 32.4% → 24.9%**, matched static exactly in calm
+uptrends; mean return is lower (the expected cost of de-risking) and there is **no
+statistically demonstrable risk-adjusted edge at this sample size** — by design,
+the call on whether the insurance is worth it is the operator's.
+
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_system.py
+.venv/bin/python tests/test_system.py      # guardrails + OCC + Black-Scholes
+.venv/bin/python tests/test_adaptive.py    # adaptive-layer invariants
 ```
 
-Proves the guardrails **block** (not just pass): per-trade cap > 3%, book cap >
-20%, VIX skip/rising/fail-closed, trend fail-closed, and every order-sanity
-violation (wrong instruction, bad sign, undefined max loss, inverted strikes,
-non-integer quantity), plus OCC round-tripping and Black-Scholes delta/IV.
+`test_system` proves the guardrails **block** (not just pass): per-trade cap >
+3%, book cap > 20%, VIX skip/rising/fail-closed, trend fail-closed, and every
+order-sanity violation, plus OCC round-tripping and Black-Scholes delta/IV.
+`test_adaptive` proves the layer can **only de-risk** (multiplier ∈ [0,1], delta
+∈ [0.20,0.30], never above base) and that the hard caps still override it.
 
 ## Project layout
 
 ```
 run.py                  # entry point: dry-run (default) / --mock offline demo
 discover.py             # READ-ONLY: dump real PentPort response shapes
+backtest.py             # one-shot historical simulation ("what if a month ago?")
+walkforward.py          # walk-forward validation of the adaptive sizing layer
 requirements.txt
 pp_options/
   config.py             # LIVE_TRADING switch + hard risk limits + universe
@@ -156,5 +202,10 @@ pp_options/
   guardrails.py         # the 4 hard preconditions (fail-closed)
   risk.py               # book-risk tracker + ledger
   engine.py             # orchestration: state -> regime -> build -> guard -> submit
-tests/test_system.py
+  regime_model.py       # adaptive sizing layer: regime classifier + clamp-to-base
+  simulate.py           # BS backtest engine (pluggable sizer, daily mark-to-model)
+  metrics.py            # CAGR / drawdown / tail-loss / hit-rate / Sharpe-Sortino
+  stats.py              # bootstrap CI + permutation p-value
+tests/test_system.py    # guardrail / OCC / BSM tests
+tests/test_adaptive.py  # adaptive-layer invariant tests
 ```

@@ -16,6 +16,7 @@ import json
 import sys
 
 from pp_options.broker import Broker, extract_equity
+from pp_options.envload import load_env
 from pp_options.live import _dig_quote_price
 
 
@@ -34,20 +35,29 @@ def _show(label: str, obj, depth_keys: int = 40) -> None:
 
 
 def main() -> int:
+    load_env()  # load .env into os.environ (no-op if absent; real env vars win)
     b = Broker()
     print("Discovery is READ-ONLY. No orders will be placed.")
 
     acct = b.choose_account()
     _show("choose_account()", acct)
 
-    bal = b.account_balance()
-    _show("account_balance()", bal)
-    eq = extract_equity(bal)
-    print(f"\n>> extract_equity() resolved: {eq} "
+    try:
+        bal = b.account_balance()
+        _show("account_balance()", bal)
+        eq = extract_equity(bal)
+    except Exception as e:
+        print(f"\n===== account_balance() FAILED: {type(e).__name__}: {e}")
+        eq = extract_equity(acct)
+        print(">> falling back to account summary for equity")
+    print(f"\n>> equity resolved: {eq} "
           f"({'OK' if eq else 'NOT FOUND -- pin the field in broker.EQUITY_FIELD_CANDIDATES'})")
 
-    _show("positions()", b.positions())
-    _show("orders()", b.orders())
+    for name, fn in [("usage()", b.usage), ("positions()", b.positions), ("orders()", b.orders)]:
+        try:
+            _show(name, fn())
+        except Exception as e:
+            print(f"\n===== {name} FAILED: {type(e).__name__}: {e}")
 
     for sym in ["SPY", "$VIX", "VIX", "^VIX"]:
         try:

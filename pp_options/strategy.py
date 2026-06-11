@@ -43,15 +43,17 @@ def _size_contracts(per_contract_max_loss: float, equity: float, risk_scale: flo
 
 
 def build_put_credit_spread(options: list[NormOption], underlying: str, equity: float,
-                            risk_scale: float) -> tuple[Optional[Spread], list[str]]:
+                            risk_scale: float,
+                            target_short_delta: float = config.TARGET_SHORT_PUT_DELTA
+                            ) -> tuple[Optional[Spread], list[str]]:
     reasons: list[str] = []
     expiry = choose_expiry(options)
     if expiry is None:
         return None, [f"no expiry in DTE window [{config.DTE_MIN},{config.DTE_MAX}]"]
 
-    short_put = select_by_delta(options, "P", expiry, config.TARGET_SHORT_PUT_DELTA)
+    short_put = select_by_delta(options, "P", expiry, target_short_delta)
     if short_put is None:
-        return None, [f"no put with a known delta near {config.TARGET_SHORT_PUT_DELTA} "
+        return None, [f"no put with a known delta near {target_short_delta} "
                       f"for expiry {expiry} (delta unavailable -> fail closed)"]
     if short_put.mid is None:
         return None, [f"short put {short_put.strike} has no usable price"]
@@ -96,7 +98,8 @@ def build_put_credit_spread(options: list[NormOption], underlying: str, equity: 
 
 
 def build_call_debit_spread(options: list[NormOption], underlying: str,
-                            equity: float) -> tuple[Optional[Spread], list[str]]:
+                            equity: float, risk_scale: float = 1.0
+                            ) -> tuple[Optional[Spread], list[str]]:
     reasons: list[str] = []
     expiry = choose_expiry(options)
     if expiry is None:
@@ -120,7 +123,7 @@ def build_call_debit_spread(options: list[NormOption], underlying: str,
         return None, [f"call debit non-positive ({net_debit:.2f}); skipping"]
     width = short_call.strike - long_call.strike
     per_contract_loss = net_debit * 100.0
-    contracts = _size_contracts(per_contract_loss, equity, 1.0)
+    contracts = _size_contracts(per_contract_loss, equity, risk_scale)
     if contracts < 1:
         return None, [f"1 contract (${per_contract_loss:.0f} debit) exceeds per-trade budget"]
 

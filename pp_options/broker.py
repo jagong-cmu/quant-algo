@@ -38,13 +38,14 @@ EQUITY_FIELD_CANDIDATES = [
     "equity", "account_equity", "total_equity",
     "net_liquidation", "net_liquidation_value", "net_liq", "liquidation_value",
     "liquidationValue", "netLiquidation", "marginEquity", "account_value",
-    "portfolio_value", "value",
+    "portfolio_value", "value", "cash_balance",
 ]
 
 
 class Broker:
     def __init__(self, sleep: Callable[[float], None] = time.sleep):
         self._client = None
+        self._account: Optional[dict] = None
         self._account_hash: Optional[str] = None
         self._sleep = sleep
         self._req_times: list[float] = []
@@ -100,6 +101,7 @@ class Broker:
     # ---- read-only state ---------------------------------------------------
     def choose_account(self) -> dict:
         acct = self._call(self.client.choose_account, config.ACCOUNT_PRODUCT)
+        self._account = acct
         self._account_hash = acct.get("account_hash")
         self.log.info("Chose %s account: hash=%s", config.ACCOUNT_PRODUCT, self._account_hash)
         return acct
@@ -123,6 +125,9 @@ class Broker:
     def orders(self) -> dict:
         return self._call(self.client.orders, account_hash=self.account_hash)
 
+    def usage(self) -> dict:
+        return self._call(self.client.usage)
+
     def quotes(self, symbols) -> dict:
         return self._call(self.client.quotes, symbols, account_hash=self.account_hash)
 
@@ -131,14 +136,30 @@ class Broker:
 
     # ---- derived helpers ---------------------------------------------------
     def equity(self) -> float:
-        """Extract account equity, failing closed if it cannot be found."""
-        bal = self.account_balance()
-        val = extract_equity(bal)
+        """Account equity, failing closed if it cannot be found.
+
+        Prefers account_balance(); falls back to the account summary
+        (account_value / cash_balance from choose_account) when the balance
+        endpoint is unavailable -- it returns HTTP 500 for competition accounts.
+        """
+        val = None
+        try:
+            bal = self.account_balance()
+            val = extract_equity(bal)
+        except PentPortAPIError as e:
+            self.log.warning("account_balance() unavailable (%s); falling back to account summary.", e)
+
+        if val is None:
+            acct = self._account or self.choose_account()
+            val = extract_equity(acct)
+            if val is not None:
+                self.log.info("Equity sourced from account summary (account_value/cash_balance).")
+
         if val is None:
             raise RuntimeError(
-                "Could not locate an equity field in account_balance() response. "
-                f"Tried {EQUITY_FIELD_CANDIDATES}. Run discover.py to see the real "
-                "shape and pin the field. Failing closed (no sizing -> no trading)."
+                "Could not determine account equity from account_balance() or the "
+                f"account summary. Tried {EQUITY_FIELD_CANDIDATES}. Run discover.py to "
+                "see the real shape. Failing closed (no sizing -> no trading)."
             )
         self.log.info("Account equity = %.2f", val)
         return val
