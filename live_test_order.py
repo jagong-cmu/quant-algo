@@ -66,10 +66,26 @@ def main() -> int:
     ap.add_argument("--contracts", type=int, default=1)
     ap.add_argument("--haircut", type=float, default=0.0,
                     help="reduce the asked net credit by this much to improve fill odds")
+    ap.add_argument("--live", action="store_true",
+                    help="ENABLE real submission for this run (overrides config.LIVE_TRADING)")
+    ap.add_argument("--force", action="store_true",
+                    help="skip the market-hours guard")
     args = ap.parse_args()
 
     load_env()
     log, path = setup_logging(tag="live_test_order")
+
+    if args.live:
+        # Market-hours guard: US options ~13:30-20:00 UTC, Mon-Fri. A scheduled
+        # run must refuse to fire real orders outside the session.
+        now = dt.datetime.now(dt.timezone.utc)
+        open_now = now.weekday() < 5 and dt.time(13, 30) <= now.time() <= dt.time(20, 0)
+        if not open_now and not args.force:
+            log.error("Market appears CLOSED (%s UTC). Refusing live submit. Use --force to override.",
+                      now.strftime("%a %H:%M"))
+            return 2
+        config.LIVE_TRADING = True   # enable the gated submit path for THIS run only
+        log.warning("LIVE submission ENABLED for this run (1 contract, defined risk).")
     log.info("Execution-path test | LIVE_TRADING=%s | %s %d-contract put credit spread (haircut %.2f)",
              config.LIVE_TRADING, args.underlying, args.contracts, args.haircut)
     broker = Broker()
