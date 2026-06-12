@@ -81,14 +81,18 @@ class AutonomousRunner:
         if os.path.exists(LEDGER_PATH):
             try:
                 d = json.load(open(LEDGER_PATH))
+                open_ = [OpenSpread(**o) for o in d.get("open", [])]   # always carry positions
                 if d.get("day") == today:
                     return RunnerState(day=today, day_start_equity=d["day_start_equity"],
-                                       open=[OpenSpread(**o) for o in d.get("open", [])],
-                                       halted=d.get("halted", False))
+                                       open=open_, halted=d.get("halted", False))
+                # NEW DAY: keep open multi-day spreads; reset the daily baseline + kill switch
+                self.log.info("new trading day -- carrying %d open spread(s), resetting daily baseline",
+                              len(open_))
+                return RunnerState(day=today, day_start_equity=self._safe_equity(),
+                                   open=open_, halted=False)
             except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
                 self.log.warning("ledger unreadable (%s); starting fresh", e)
-        eq = self._safe_equity()
-        return RunnerState(day=today, day_start_equity=eq)
+        return RunnerState(day=today, day_start_equity=self._safe_equity())
 
     def _persist(self) -> None:
         os.makedirs(os.path.dirname(LEDGER_PATH), exist_ok=True)

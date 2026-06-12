@@ -27,23 +27,26 @@ from pp_options.runner import AutonomousRunner
 def main() -> int:
     ap = argparse.ArgumentParser(description="Autonomous supervised runner")
     ap.add_argument("--live", action="store_true", help="enable REAL submission (market hours only)")
-    ap.add_argument("--loop", action="store_true", help="run the session loop until close")
+    ap.add_argument("--loop", action="store_true", help="run one session loop until close")
+    ap.add_argument("--daemon", action="store_true", help="run forever (server mode); cycles act only in market hours")
     ap.add_argument("--interval", type=int, default=300, help="poll seconds")
-    ap.add_argument("--force", action="store_true", help="skip the market-hours guard (live)")
+    ap.add_argument("--force", action="store_true", help="skip the market-hours guard (live one-shot/loop)")
     args = ap.parse_args()
 
     load_env()
     log, path = setup_logging(tag="autorun")
+    from pp_options.runner import DAILY_LOSS_HALT_PCT
 
     if args.live:
         now = dt.datetime.now(dt.timezone.utc)
-        if not AutonomousRunner.market_open(now) and not args.force:
-            log.error("Market closed (%s UTC). Refusing --live. Use --force only if you mean it.",
+        # A one-shot/loop --live run must be inside market hours; the daemon may
+        # start anytime and simply waits (run_cycle self-idles when closed).
+        if not args.daemon and not AutonomousRunner.market_open(now) and not args.force:
+            log.error("Market closed (%s UTC). Refusing --live. Use --daemon (waits) or --force.",
                       now.strftime("%a %H:%M"))
             return 2
         config.LIVE_TRADING = True
-        log.warning("AUTONOMOUS LIVE TRADING ENABLED. Kill switch at -%.0f%%/day. Ctrl-C to stop.",
-                    __import__("pp_options.runner", fromlist=["DAILY_LOSS_HALT_PCT"]).DAILY_LOSS_HALT_PCT * 100)
+        log.warning("AUTONOMOUS LIVE TRADING ENABLED. Kill switch at -%.0f%%/day.", DAILY_LOSS_HALT_PCT * 100)
     else:
         log.info("PAPER mode (LIVE_TRADING=False) -- entries logged, not submitted.")
 
@@ -51,7 +54,16 @@ def main() -> int:
     runner = AutonomousRunner(Broker(), paper=not args.live)
 
     try:
-        if args.loop:
+        if args.daemon:
+            log.warning("DAEMON mode (server): running forever; entries occur only during market hours. "
+                        "Stop with systemctl/docker.")
+            while True:
+                try:
+                    runner.run_cycle()
+                except Exception as e:                       # never let one cycle kill the daemon
+                    log.exception("cycle error (continuing): %s", e)
+                time.sleep(args.interval if AutonomousRunner.market_open() else max(args.interval, 600))
+        elif args.loop:
             while AutonomousRunner.market_open():
                 runner.run_cycle()
                 time.sleep(args.interval)
@@ -60,7 +72,7 @@ def main() -> int:
             runner.run_cycle()
             log.info("Single cycle done. Log: %s", path)
     except KeyboardInterrupt:
-        log.warning("Interrupted by user -- stopping. Open positions persist in the ledger.")
+        log.warning("Interrupted -- stopping. Open positions persist in the ledger.")
     return 0
 
 

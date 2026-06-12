@@ -1,0 +1,27 @@
+# systemd unit for the autonomous runner (non-Docker deployment).
+# Install on a server YOU control:
+#   sudo cp deploy/quantalgo.service /etc/systemd/system/
+#   sudo install -m 600 /dev/stdin /etc/quantalgo.env <<<'PENTPORT_API_KEY=pp_live_...'
+#   sudo systemctl daemon-reload && sudo systemctl enable --now quantalgo
+#   journalctl -u quantalgo -f
+[Unit]
+Description=Autonomous PentPort options runner (LIVE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/opt/quant-algo
+# Key as a root-owned 600 secret file, NOT in the unit and NOT in git:
+EnvironmentFile=/etc/quantalgo.env
+ExecStart=/opt/quant-algo/.venv/bin/python autorun.py --live --daemon
+Restart=always
+RestartSec=15
+# basic hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/quant-algo/logs /opt/quant-algo/state
+
+[Install]
+WantedBy=multi-user.target
