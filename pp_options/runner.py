@@ -33,7 +33,7 @@ from .risk import BookRiskTracker
 # ---- autonomous-runner config ---------------------------------------------
 AUTO_UNDERLYING = "SPY"
 AUTO_CONTRACTS = 1               # v1 conservative fixed size
-AUTO_MAX_CONCURRENT = 1          # one open spread at a time in v1
+AUTO_MAX_CONCURRENT = 20         # up to 20 concurrent spreads (still bounded by the 20% book cap)
 AUTO_WIDTH = 5.0
 EXIT_DTE = 7                     # close when the spread is within a week of expiry
 PROFIT_TARGET_FRAC = 0.50        # close at 50% of max profit (credit captured)
