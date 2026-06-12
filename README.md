@@ -87,6 +87,50 @@ would-be orders:
 
 ---
 
+## Trade management (close early, never hold to expiry)
+
+The autonomous runner (`autorun.py`) does **not** hold spreads to expiration.
+Every cycle each tracked spread is marked-to-market from live option quotes and
+closed on the **first** of:
+
+| Trigger | Default | Why |
+|---|---|---|
+| Profit target | 50% of max profit captured | best risk-adjusted exit for short premium |
+| Stop-loss | loss ≥ 2× credit received | caps the downside before expiry |
+| Time stop | DTE ≤ 21 | exits before the high-gamma final weeks |
+| Hard backstop | DTE ≤ 7 | never carry inside a week of expiry |
+
+Thresholds live at the top of `pp_options/runner.py`
+(`PROFIT_TARGET_FRAC`, `STOP_LOSS_MULT`, `MANAGE_DTE`, `EXIT_DTE`). Closes unwind
+the **short leg first** (never momentarily naked).
+
+**Can't close → you get notified.** In paper/dry-run nothing is really
+submitted, and a live close can error. In either case the runner *keeps* the
+position, flags it `close_pending`, and raises an **action-required alert**
+(`pp_options/notify.py` → `state/alerts.json`, logged at CRITICAL, and POSTed to
+`PP_ALERT_WEBHOOK` if set) listing the exact legs to close manually. It never
+silently drops a live spread.
+
+## Dashboard (observe + control)
+
+A dependency-free local UI:
+
+```bash
+python dashboard.py            # http://127.0.0.1:8787
+# PP_DASH_PORT=9000 python dashboard.py
+# PP_ROOT=/path/to/checkout python dashboard.py   # watch a runner in another checkout
+```
+
+It shows mode (PAPER/LIVE), market state, equity, day P/L, the kill switch, open
+positions (with live mark + profit %), action-required alerts, a tail of the
+latest runner log, and the live config. Buttons let you **Halt/Resume** entries,
+**Close** a position, **Mark closed** (drop a manually-closed spread), and
+**Dismiss** alerts. The dashboard never touches the broker — it enqueues into
+`state/commands.json`, which the runner drains each cycle (the runner stays the
+single execution path), so it's safe to run alongside a live session.
+
+---
+
 ## What was verified against the real package/docs
 
 - The SDK is class-based: `pp = PentPort()` then `accounts()`,
