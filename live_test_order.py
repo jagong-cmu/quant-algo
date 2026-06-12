@@ -133,19 +133,26 @@ def main() -> int:
         return 1
     log.info("Guardrails OK (%s)", report.summary())
 
-    payload = spread.to_payload()
-    log_payload(log, "Order payload:", payload)
-    result = broker.submit_options_order(payload)   # gated by LIVE_TRADING
+    # Execute via the SAFE executor: protective long leg first, confirm it is
+    # held, only then the short -> a leg-out can never leave a naked short.
+    from pp_options.execution import SpreadExecutor
+    ex = SpreadExecutor(broker)
 
-    if config.LIVE_TRADING and isinstance(result, dict) and not result.get("dry_run"):
-        log.info("Submitted. Confirming via orders()/positions() ...")
+    if config.LIVE_TRADING:
+        result = ex.open_spread(spread)
+        log.warning("Execution result: %s -- %s", result.status, result.message)
+        if result.naked:
+            log.critical("NAKED POSITION DETECTED -- this should be impossible; investigate now.")
         try:
             log_payload(log, "orders():", broker.orders())
             log_payload(log, "positions():", broker.positions())
         except Exception as e:
             log.warning("confirmation read failed: %s", e)
     else:
-        log.info("DRY-RUN: nothing submitted. Flip LIVE_TRADING=True at the open to place it.")
+        log.info("[DRY-RUN] safe execution plan -- protective LONG leg first, then SHORT:")
+        for i, leg_payload in enumerate(ex.plan(spread), 1):
+            log_payload(log, f"  leg {i}/2:", leg_payload)
+        log.info("DRY-RUN: nothing submitted.")
     log.info("Log: %s", path)
     return 0
 
