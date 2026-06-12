@@ -31,9 +31,9 @@ from .models import Leg, Spread
 from .risk import BookRiskTracker
 
 # ---- autonomous-runner config ---------------------------------------------
-AUTO_UNDERLYING = "SPY"
-AUTO_CONTRACTS = 1               # v1 conservative fixed size
-AUTO_MAX_CONCURRENT = 20         # up to 20 concurrent spreads (still bounded by the 20% book cap)
+AUTO_UNDERLYINGS = ["SPY", "QQQ", "IWM"]   # diversify across liquid index ETFs
+AUTO_CONTRACTS = 2               # 2 contracts/spread (doubled)
+AUTO_MAX_CONCURRENT = 20         # up to 20 concurrent spreads (still bounded by the book cap)
 AUTO_WIDTH = 5.0
 EXIT_DTE = 7                     # close when the spread is within a week of expiry
 PROFIT_TARGET_FRAC = 0.50        # close at 50% of max profit (credit captured)
@@ -153,24 +153,30 @@ class AutonomousRunner:
 
     # ---- entry -------------------------------------------------------------
     def _maybe_enter(self, equity: float) -> None:
-        spread = self._build_spread(equity)
+        # diversify: add a spread on the least-represented underlying this cycle
+        counts = {u: 0 for u in AUTO_UNDERLYINGS}
+        for o in self.state.open:
+            counts[o.underlying] = counts.get(o.underlying, 0) + 1
+        underlying = min(AUTO_UNDERLYINGS, key=lambda u: counts[u])
+
+        spread = self._build_spread(equity, underlying)
         if spread is None:
-            self.log.info("[ENTRY] no valid spread this cycle")
+            self.log.info("[ENTRY] %s: no valid spread this cycle", underlying)
             return
         rep = guardrails.evaluate_order(spread, equity, BookRiskTracker(equity, self._book_risk()))
         if rep.blocked:
-            self.log.warning("[ENTRY] blocked by guardrails: %s", " | ".join(rep.block_reasons))
+            self.log.warning("[ENTRY] %s blocked by guardrails: %s", underlying, " | ".join(rep.block_reasons))
             return
-        self.log.info("[ENTRY] opening %s via safe executor: %s", AUTO_UNDERLYING, "; ".join(spread.notes))
+        self.log.info("[ENTRY] opening %s via safe executor: %s", underlying, "; ".join(spread.notes))
         result = self.executor.open_spread(spread)
-        self.log.warning("[ENTRY] execution result: %s -- %s", result.status, result.message)
+        self.log.warning("[ENTRY] %s execution result: %s -- %s", underlying, result.status, result.message)
         if result.naked:
             self.log.critical("NAKED -- impossible by design; halting.")
             self.state.halted = True
             return
         if result.status in ("COMPLETE", "LONG_ONLY"):
             self.state.open.append(OpenSpread(
-                underlying=AUTO_UNDERLYING, short_sym=spread.short_leg.option.symbol,
+                underlying=underlying, short_sym=spread.short_leg.option.symbol,
                 long_sym=spread.long_leg.option.symbol, short_k=spread.short_leg.option.strike,
                 long_k=spread.long_leg.option.strike, expiry=spread.short_leg.option.expiry.isoformat(),
                 contracts=spread.contracts, entry_credit=spread.net_credit or 0.0,
@@ -180,9 +186,9 @@ class AutonomousRunner:
         return sum(o.max_loss for o in self.state.open)
 
     # ---- spread construction from real chain -------------------------------
-    def _build_spread(self, equity: float) -> Optional[Spread]:
+    def _build_spread(self, equity: float, underlying: str) -> Optional[Spread]:
         try:
-            raw = self.broker.options_chain(AUTO_UNDERLYING)
+            raw = self.broker.options_chain(underlying)
             inner = raw.get("chain", raw)
             allx = inner.get("allExpiries") or []
             today = dt.date.today()
@@ -192,12 +198,12 @@ class AutonomousRunner:
             if not dated:
                 return None
             expiry = min(dated, key=lambda x: abs(x[1] - target))[0]
-            raw = self.broker.options_chain(AUTO_UNDERLYING, expiry=expiry)
+            raw = self.broker.options_chain(underlying, expiry=expiry)
         except Exception as e:
-            self.log.warning("chain fetch failed: %s", e)
+            self.log.warning("[%s] chain fetch failed: %s", underlying, e)
             return None
         spot = chainmod.underlying_price(raw)
-        norm = chainmod.normalize(raw, AUTO_UNDERLYING, spot)
+        norm = chainmod.normalize(raw, underlying, spot)
         exp_date = dt.date.fromisoformat(expiry)
         puts = [o for o in chainmod.strikes_for(norm, "P", exp_date) if o.delta is not None and o.mid]
         if not puts:
@@ -210,7 +216,7 @@ class AutonomousRunner:
         credit = round(short_put.mid - long_put.mid, 2)
         if credit <= 0:
             return None
-        return Spread(AUTO_UNDERLYING, "put_credit",
+        return Spread(underlying, "put_credit",
                       Leg(short_put, "SELL_TO_OPEN"), Leg(long_put, "BUY_TO_OPEN"),
                       contracts=AUTO_CONTRACTS, net_credit=credit,
                       notes=[f"short {short_put.strike}P (d={short_put.delta:.2f}) / "
