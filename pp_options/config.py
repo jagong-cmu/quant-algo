@@ -19,7 +19,7 @@ from __future__ import annotations
 # ----------------------------------------------------------------------------
 # MASTER SWITCH
 # ----------------------------------------------------------------------------
-LIVE_TRADING: bool = False  # <-- keep False until you have reviewed logged orders
+LIVE_TRADING: bool = True   # <-- LIVE: real orders submitted during market hours (2x margin, no kill switch)
 
 # ----------------------------------------------------------------------------
 # Account selection
@@ -29,7 +29,7 @@ ACCOUNT_PRODUCT = "options"  # passed to choose_account()
 # ----------------------------------------------------------------------------
 # Universe & structure
 # ----------------------------------------------------------------------------
-UNIVERSE = ["SPY", "QQQ", "IWM"]
+UNIVERSE = ["SPY", "QQQ", "IWM", "DIA", "GLD", "EEM", "EFA", "TLT"]
 
 DTE_MIN = 30
 DTE_MAX = 45
@@ -49,8 +49,8 @@ CALL_DEBIT_WIDTHS = [1.0, 2.0, 3.0, 5.0]
 # ----------------------------------------------------------------------------
 # HARD RISK LIMITS  (do not make these bypassable)
 # ----------------------------------------------------------------------------
-MAX_TRADE_RISK_PCT = 0.03   # per-spread defined-risk max loss <= 3% of equity
-MAX_BOOK_RISK_PCT = 0.20    # sum of open defined-risk max loss <= 20% of equity
+MAX_TRADE_RISK_PCT = 0.05   # per-spread defined-risk max loss <= 5% of equity
+MAX_BOOK_RISK_PCT = 2.00    # sum of open defined-risk max loss <= 200% of equity (2x MARGIN / buying power)
 
 # ----------------------------------------------------------------------------
 # Volatility regime filter
@@ -68,7 +68,10 @@ TREND_SMA_DAYS = 200
 # ----------------------------------------------------------------------------
 RISK_FREE_RATE = 0.04
 # Rough dividend yields used only for delta estimation; conservative defaults.
-DIVIDEND_YIELD = {"SPY": 0.013, "QQQ": 0.006, "IWM": 0.012}
+DIVIDEND_YIELD = {
+    "SPY": 0.013, "QQQ": 0.006, "IWM": 0.012,
+    "DIA": 0.017, "GLD": 0.0, "EEM": 0.025, "EFA": 0.030, "TLT": 0.038,
+}
 DEFAULT_DIVIDEND_YIELD = 0.01
 
 # ----------------------------------------------------------------------------
@@ -89,7 +92,7 @@ BOOK_LEDGER_PATH = "state/book_ledger.json"
 def validate_config() -> None:
     """Fail fast if someone weakens a hard limit past a sane bound."""
     assert 0 < MAX_TRADE_RISK_PCT <= 0.05, "per-trade risk cap must stay <= 5%"
-    assert 0 < MAX_BOOK_RISK_PCT <= 0.50, "book risk cap must stay <= 50%"
+    assert 0 < MAX_BOOK_RISK_PCT <= 2.00, "book risk cap must stay <= 200% (2x margin)"
     assert MAX_TRADE_RISK_PCT <= MAX_BOOK_RISK_PCT
     assert DTE_MIN <= DTE_MAX
     assert VIX_ELEVATED < VIX_SKIP

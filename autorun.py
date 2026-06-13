@@ -46,7 +46,8 @@ def main() -> int:
                       now.strftime("%a %H:%M"))
             return 2
         config.LIVE_TRADING = True
-        log.warning("AUTONOMOUS LIVE TRADING ENABLED. Kill switch at -%.0f%%/day.", DAILY_LOSS_HALT_PCT * 100)
+        log.warning("AUTONOMOUS LIVE TRADING ENABLED. Daily kill switch DISABLED; book cap %.0f%% "
+                    "(full deployment). No automatic daily-loss halt.", config.MAX_BOOK_RISK_PCT * 100)
     else:
         log.info("PAPER mode (LIVE_TRADING=False) -- entries logged, not submitted.")
 

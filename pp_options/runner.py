@@ -38,9 +38,13 @@ from .notify import AlertStore
 from .risk import BookRiskTracker
 
 # ---- autonomous-runner config ---------------------------------------------
-AUTO_UNDERLYINGS = ["SPY", "QQQ", "IWM"]   # diversify across liquid index ETFs
-AUTO_CONTRACTS = 2               # 2 contracts/spread (doubled)
-AUTO_MAX_CONCURRENT = 20         # up to 20 concurrent spreads (still bounded by the book cap)
+AUTO_UNDERLYINGS = ["SPY", "QQQ", "IWM",   # US equity: large / nasdaq / small cap
+                    "DIA",                  # US large-cap (Dow)
+                    "GLD",                  # gold (low equity correlation)
+                    "EEM", "EFA",           # emerging + developed international equity
+                    "TLT"]                  # long-dated US Treasuries (bonds)
+AUTO_CONTRACTS = 2               # fallback only; sizing now scales to MAX_TRADE_RISK_PCT (see _build_spread)
+AUTO_MAX_CONCURRENT = 40         # raised so the 100% book cap is the binding limit, not the count
 AUTO_WIDTH = 5.0
 # ---- exit / trade-management policy ----------------------------------------
 # Short-premium spreads are MANAGED EARLY, not held to expiry: gamma risk spikes
@@ -170,15 +174,9 @@ class AutonomousRunner:
         return now.weekday() < 5 and SESSION_OPEN <= now.time() <= SESSION_CLOSE
 
     def _check_kill_switch(self, equity: float) -> bool:
-        loss = (equity - self.state.day_start_equity) / self.state.day_start_equity
-        if loss <= -DAILY_LOSS_HALT_PCT and not self.state.halted:
-            self.state.halted = True
-            self.log.error("KILL SWITCH: day P/L %.1f%% <= -%.0f%% -> halting new entries.",
-                           loss * 100, DAILY_LOSS_HALT_PCT * 100)
-            self.alerts.push(key=f"killswitch:{self.state.day}", kind="kill_switch",
-                             title="KILL SWITCH tripped -- new entries halted",
-                             detail=f"Day P/L {loss * 100:.1f}% <= -{DAILY_LOSS_HALT_PCT * 100:.0f}%. "
-                                    "Open positions are still managed; no new entries until you Resume.")
+        # DAILY LOSS KILL SWITCH DISABLED by configuration: the runner no longer
+        # auto-halts new entries on a bad day. Only a manual dashboard "halt"
+        # command sets self.state.halted now. Open positions are still managed.
         return self.state.halted
 
     # ---- dashboard control queue -------------------------------------------
@@ -416,9 +414,13 @@ class AutonomousRunner:
         credit = round(short_put.mid - long_put.mid, 2)
         if credit <= 0:
             return None
+        # Scale contracts to the per-trade risk budget so the book fills toward 100%.
+        per_contract_max_loss = (AUTO_WIDTH - credit) * 100.0
+        budget = config.MAX_TRADE_RISK_PCT * equity
+        contracts = max(1, int(budget // per_contract_max_loss)) if per_contract_max_loss > 0 else AUTO_CONTRACTS
         return Spread(underlying, "put_credit",
                       Leg(short_put, "SELL_TO_OPEN"), Leg(long_put, "BUY_TO_OPEN"),
-                      contracts=AUTO_CONTRACTS, net_credit=credit,
+                      contracts=contracts, net_credit=credit,
                       notes=[f"short {short_put.strike}P (d={short_put.delta:.2f}) / "
                              f"long {long_put.strike}P, credit {credit:.2f}"])
 

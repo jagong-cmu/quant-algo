@@ -18,6 +18,8 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, Optional
 
+import requests
+
 from . import config
 from .logutil import get_logger, log_payload
 
@@ -59,7 +61,7 @@ class Broker:
                 raise RuntimeError(
                     "pentport SDK not importable; use --mock for an offline dry-run."
                 )
-            self._client = PentPort()  # reads PENTPORT_API_KEY
+            self._client = PentPort(timeout=60)  # reads PENTPORT_API_KEY; chain endpoint is slow
         return self._client
 
     def _throttle(self) -> None:
@@ -74,7 +76,13 @@ class Broker:
         self._req_times.append(time.monotonic())
 
     def _call(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
-        """Invoke an SDK method with throttling, retries, and 429 handling."""
+        """Invoke an SDK method with throttling, retries, and 429 handling.
+
+        Pass _idempotent=False for non-idempotent calls (order submission): on an
+        ambiguous failure (timeout / 5xx) it raises immediately instead of
+        retrying, so a possibly-placed order is never double-submitted.
+        """
+        idempotent = kwargs.pop("_idempotent", True)
         last_exc: Optional[Exception] = None
         for attempt in range(1, config.REQUEST_RETRIES + 1):
             self._throttle()
@@ -92,8 +100,23 @@ class Broker:
                 if status is not None and 400 <= status < 500:
                     self.log.error("API error %s (no retry): %s", status, e)
                     raise
+                if not idempotent:
+                    self.log.error("non-idempotent call failed (HTTP %s) -> NOT retrying; "
+                                   "verify via orders()/positions()", status)
+                    raise
                 backoff = config.RETRY_BACKOFF_SECONDS * attempt
                 self.log.warning("API error %s; backing off %.1fs (attempt %d)", status, backoff, attempt)
+                self._sleep(backoff)
+            except requests.exceptions.RequestException as e:
+                # timeouts / connection drops are not PentPortAPIError
+                last_exc = e
+                if not idempotent:
+                    self.log.error("non-idempotent call network error (%s) -> order status UNKNOWN; "
+                                   "NOT retrying; verify via orders()/positions()", type(e).__name__)
+                    raise
+                backoff = config.RETRY_BACKOFF_SECONDS * attempt
+                self.log.warning("network error (%s); backing off %.1fs (attempt %d)",
+                                 type(e).__name__, backoff, attempt)
                 self._sleep(backoff)
         assert last_exc is not None
         raise last_exc
@@ -183,6 +206,7 @@ class Broker:
             complex_order_strategy_type=payload.get("complex_order_strategy_type", "NONE"),
             order_strategy_type=payload.get("order_strategy_type", "SINGLE"),
             account_hash=self.account_hash,
+            _idempotent=False,   # never blindly retry a possibly-placed order
         )
         log_payload(self.log, "[LIVE] trade_options response:", result if isinstance(result, dict) else {"result": result})
         return result

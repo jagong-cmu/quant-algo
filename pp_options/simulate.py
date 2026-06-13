@@ -22,6 +22,7 @@ import requests
 from . import chain as chainmod
 from . import config, guardrails
 from .bsm import bs_price
+from . import ivsurface
 from .regime_model import BASE_DELTA, RegimeFeatures
 from .risk import BookRiskTracker
 from .strategy import build_call_debit_spread, build_put_credit_spread
@@ -47,7 +48,7 @@ def _fetch(symbol: str, rng: str) -> list[tuple[dt.date, float]]:
 class MarketData:
     """Aligned multi-symbol daily closes with a SPY-based trading calendar."""
 
-    SYMBOLS = ["SPY", "QQQ", "IWM", "^VIX", "^VIX3M"]
+    SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "EEM", "EFA", "TLT", "^VIX", "^VIX3M"]
 
     def __init__(self, rng: str = "5y"):
         self.series: dict[str, list[tuple[dt.date, float]]] = {
@@ -104,6 +105,19 @@ def iv_from_vix(underlying: str, vix_level: float) -> float:
     return (vix_level / 100.0) * IV_FACTOR.get(underlying.upper(), 1.0)
 
 
+def iv_for(underlying: str, S: float, K: float, vix: Optional[float],
+           flat: Optional[float] = None) -> float:
+    """Per-strike IV from the calibrated competition surface when available;
+    otherwise the legacy flat VIX-based IV. `flat` is the precomputed fallback."""
+    if vix is not None:
+        surf = ivsurface.load()
+        if surf is not None:
+            v = surf.iv(underlying, S, K, vix)
+            if v is not None:
+                return v
+    return flat if flat is not None else iv_from_vix(underlying, vix if vix is not None else 18.0)
+
+
 def features_at(md: MarketData, d: dt.date) -> Optional[RegimeFeatures]:
     """Market-regime features using ONLY data with date <= d (no lookahead)."""
     vix = md.close("^VIX", d)
@@ -119,21 +133,25 @@ def features_at(md: MarketData, d: dt.date) -> Optional[RegimeFeatures]:
 
 
 # ---- synthetic BS chain at a historical date -------------------------------
-def build_raw_chain(underlying: str, S: float, iv: float, expiry: dt.date, dte: int) -> dict:
+def build_raw_chain(underlying: str, S: float, iv: float, expiry: dt.date, dte: int,
+                    vix: Optional[float] = None) -> dict:
+    """Synthetic BS chain. With `vix` and a calibrated surface, each strike is
+    priced at its own (skewed) IV; otherwise every strike uses the flat `iv`."""
     r = config.RISK_FREE_RATE
     q = config.DIVIDEND_YIELD.get(underlying.upper(), config.DEFAULT_DIVIDEND_YIELD)
     T = dte / 365.0
     options = []
     for strike in range(int(S * 0.80), int(S * 1.12) + 1):
+        iv_k = iv_for(underlying, S, float(strike), vix, flat=iv)
         for right in ("C", "P"):
-            fair = bs_price(S, strike, r, q, iv, T, right)
+            fair = bs_price(S, strike, r, q, iv_k, T, right)
             spr = max(0.02, 0.01 * fair)
             options.append({
                 "putCall": "CALL" if right == "C" else "PUT",
                 "strikePrice": float(strike),
                 "bid": max(0.01, round(fair - spr / 2, 2)),
                 "ask": round(fair + spr / 2, 2),
-                "volatility": round(iv * 100, 2),
+                "volatility": round(iv_k * 100, 2),
                 "expirationDate": expiry.isoformat(),
                 "daysToExpiration": dte,
             })
@@ -153,17 +171,20 @@ class Position:
     entry_date: dt.date
     expiry: dt.date
 
-    def _close_value(self, S: float, iv: float, d: dt.date) -> float:
+    def _close_value(self, S: float, iv: float, d: dt.date,
+                     vix: Optional[float] = None) -> float:
         r = config.RISK_FREE_RATE
         q = config.DIVIDEND_YIELD.get(self.underlying.upper(), config.DEFAULT_DIVIDEND_YIELD)
         T = max((self.expiry - d).days, 0) / 365.0
         right = "P" if self.kind == "put_credit" else "C"
-        sp = bs_price(S, self.short_k, r, q, iv, T, right)
-        lp = bs_price(S, self.long_k, r, q, iv, T, right)
+        iv_s = iv_for(self.underlying, S, self.short_k, vix, flat=iv)
+        iv_l = iv_for(self.underlying, S, self.long_k, vix, flat=iv)
+        sp = bs_price(S, self.short_k, r, q, iv_s, T, right)
+        lp = bs_price(S, self.long_k, r, q, iv_l, T, right)
         return (sp - lp) if self.kind == "put_credit" else (lp - sp)
 
-    def pnl(self, S: float, iv: float, d: dt.date) -> float:
-        cv = self._close_value(S, iv, d)
+    def pnl(self, S: float, iv: float, d: dt.date, vix: Optional[float] = None) -> float:
+        cv = self._close_value(S, iv, d, vix)
         if self.kind == "put_credit":
             return (self.entry_net - cv) * 100 * self.contracts
         return (cv - self.entry_net) * 100 * self.contracts
@@ -315,7 +336,7 @@ def _open_cycle(md: MarketData, entry: dt.date, expiry: dt.date, dte: int,
             continue
         _, S0 = hit
         iv0 = iv_from_vix(u, vix_e)
-        norm = chainmod.normalize(build_raw_chain(u, S0, iv0, expiry, dte), u, S0)
+        norm = chainmod.normalize(build_raw_chain(u, S0, iv0, expiry, dte, vix=vix_e), u, S0)
         tracker = BookRiskTracker(equity=EQUITY, open_risk=0.0)
 
         sp, _ = build_put_credit_spread(norm, u, EQUITY, eff_mult, target_short_delta=eff_delta)
@@ -388,8 +409,8 @@ def simulate(md: MarketData, test_start: dt.date, test_end: dt.date, sizer: Size
         for p in open_pos:
             if p.expiry <= d:
                 S = md.close(p.underlying, d) or md.close(p.underlying, p.expiry)
-                ivx = iv_from_vix(p.underlying, md.close("^VIX", d) or 18.0)
-                pl = p.pnl(S, ivx, p.expiry)
+                vix_x = md.close("^VIX", d) or 18.0
+                pl = p.pnl(S, iv_from_vix(p.underlying, vix_x), p.expiry, vix=vix_x)
                 realized += pl
                 closed.append(TradeResult(
                     underlying=p.underlying, kind=p.kind, entry_date=p.entry_date,
@@ -405,7 +426,7 @@ def simulate(md: MarketData, test_start: dt.date, test_end: dt.date, sizer: Size
         for p in open_pos:
             S = md.close(p.underlying, d)
             if S is not None:
-                mtm += p.pnl(S, iv_from_vix(p.underlying, vix_d), d)
+                mtm += p.pnl(S, iv_from_vix(p.underlying, vix_d), d, vix=vix_d)
         daily.append((d, EQUITY + realized + mtm))
 
     # mark any still-open positions to model as of the last sim day (year-end MTM)
@@ -419,7 +440,7 @@ def simulate(md: MarketData, test_start: dt.date, test_end: dt.date, sizer: Size
             closed.append(TradeResult(
                 underlying=p.underlying, kind=p.kind, entry_date=p.entry_date,
                 expiry=p.expiry, contracts=p.contracts, max_loss=p.max_loss,
-                realized_pnl=p.pnl(S, iv_from_vix(p.underlying, vix_d), last_day),
+                realized_pnl=p.pnl(S, iv_from_vix(p.underlying, vix_d), last_day, vix=vix_d),
                 regime="", reduced=False, short_k=p.short_k, long_k=p.long_k,
                 entry_net=p.entry_net, open_at_end=True))
 

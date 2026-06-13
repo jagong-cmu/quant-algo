@@ -51,7 +51,11 @@ def main() -> int:
                     help="disable hardening (trend filter / time-stop / cooldown)")
     ap.add_argument("--days", type=int, default=0,
                     help="fetch this many calendar days of 5m bars (max ~60); 0 = use --range")
+    ap.add_argument("--dte", type=int, default=ID.INTRADAY_DTE,
+                    help="0 = 0-DTE flat-IV version (FRAGILE); >0 = short-dated on the "
+                         "validated competition surface (TRUSTWORTHY, default 5)")
     args = ap.parse_args()
+    ID.INTRADAY_DTE = args.dte   # 0 = 0-DTE flat-IV version | >0 = short-dated surface version
 
     series = vix = None
     win = args.range
@@ -123,9 +127,15 @@ def main() -> int:
               f"{d.end_equity:>14,.0f}{flag}")
 
     print(f"\n  Trade log CSV: {csv_path}")
-    print("\n  NOTE: 0DTE option prices are Black-Scholes-modeled off a flat VIX -- real 0DTE")
-    print("  IV/skew and bid/ask differ materially. Direction is real; magnitudes approximate.")
-    print("  This is the single biggest caveat before trusting the dollar P/L. LIVE_TRADING=False.")
+    from pp_options import intraday as _ID
+    if _ID.INTRADAY_DTE > 0:
+        print(f"\n  PRICING: {_ID.INTRADAY_DTE}-DTE options on the calibrated competition skew "
+              "surface (state/iv_surface_short.json).")
+        print("  Faithful to PentPort's BS pricing (no bid/ask, no fees); skew shape is a snapshot.")
+    else:
+        print("\n  NOTE: 0DTE priced at a FLAT IV -- the 0-DTE backtest is wildly IV-sensitive; "
+              "magnitudes are NOT trustworthy.")
+    print("  LIVE_TRADING=False.")
     return 0
 
 

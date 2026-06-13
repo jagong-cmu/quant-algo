@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
 
-from . import bsm, config
+from . import bsm, config, ivsurface
 
 # ---- aggressive intraday config (separate from the conservative caps) ------
 INTRADAY_UNIVERSE = ["SPY", "QQQ", "IWM"]   # 0-DTE-capable index ETFs
@@ -41,7 +42,32 @@ SHORT_LEG_DELTA = 0.30            # sell OTM to cap cost
 STOP_FRAC = 0.50                  # exit if the spread loses 50% of the debit
 TARGET_FRAC = 0.80                # exit at 80% of max profit (width - debit)
 SHORT_DTE_DAYS = 0                # 0 = same-day expiry (0DTE)
-IV_FACTOR = {"SPY": 1.00, "QQQ": 1.12, "IWM": 1.25}
+IV_FACTOR = {"SPY": 1.00, "QQQ": 1.12, "IWM": 1.25}   # legacy VIX-based (IV_MODE="vix")
+
+# The PentPort competition prices same-day 0-DTE options at a FLAT IV (validated
+# 2026-06-12: the 0-DTE chain reports impliedVolatility=20 for every strike, no
+# skew; dated expiries carry a real surface instead). Faithful 0-DTE pricing =
+# Black-Scholes at this flat IV with live intraday time-to-expiry.
+ZERO_DTE_IV = float(os.environ.get("ZERO_DTE_IV", "0.20"))
+IV_MODE = os.environ.get("INTRADAY_IV_MODE", "competition").lower()  # competition|vix
+
+# DTE of the options traded. 0 = same-day 0-DTE (flat ZERO_DTE_IV, FRAGILE: the 0-DTE
+# backtest is wildly IV-sensitive). >0 = short-dated options priced on the calibrated,
+# VALIDATED competition skew surface (state/iv_surface_short.json) -> trustworthy. The
+# strategy is still intraday: positions are flattened at each day's close regardless.
+INTRADAY_DTE = int(os.environ.get("INTRADAY_DTE", "5"))
+
+
+def _leg_iv(symbol: str, S: float, K: float, vix, flat: float) -> float:
+    """Per-strike IV from the short-dated competition surface when trading short-DTE
+    options; otherwise the flat 0-DTE IV."""
+    if INTRADAY_DTE > 0 and vix is not None:
+        surf = ivsurface.load(ivsurface.SHORT_PATH)
+        if surf is not None:
+            v = surf.iv(symbol, S, K, vix)
+            if v is not None:
+                return v
+    return flat
 
 YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/{s}"
 _HDR = {"User-Agent": "Mozilla/5.0 (compatible; pp-intraday/1.0)"}
@@ -129,25 +155,29 @@ class Spread:
     def max_profit(self) -> float:
         return (self.width - self.debit) * 100 * self.contracts
 
-    def value(self, S: float, iv: float, now: dt.datetime) -> float:
-        """Per-share value of the debit spread now (long - short)."""
+    def value(self, S: float, iv: float, now: dt.datetime, vix=None) -> float:
+        """Per-share value of the debit spread now (long - short). Each leg is
+        priced at its own surface IV when `vix` is given (short-DTE mode)."""
         T = _years_to(self.expiry, now)
         q = config.DIVIDEND_YIELD.get(self.symbol, config.DEFAULT_DIVIDEND_YIELD)
-        lp = bsm.bs_price(S, self.long_k, config.RISK_FREE_RATE, q, iv, T, self.right)
-        sp = bsm.bs_price(S, self.short_k, config.RISK_FREE_RATE, q, iv, T, self.right)
+        iv_l = _leg_iv(self.symbol, S, self.long_k, vix, iv)
+        iv_s = _leg_iv(self.symbol, S, self.short_k, vix, iv)
+        lp = bsm.bs_price(S, self.long_k, config.RISK_FREE_RATE, q, iv_l, T, self.right)
+        sp = bsm.bs_price(S, self.short_k, config.RISK_FREE_RATE, q, iv_s, T, self.right)
         return lp - sp
 
-    def pnl(self, S: float, iv: float, now: dt.datetime) -> float:
-        return (self.value(S, iv, now) - self.debit) * 100 * self.contracts
+    def pnl(self, S: float, iv: float, now: dt.datetime, vix=None) -> float:
+        return (self.value(S, iv, now, vix) - self.debit) * 100 * self.contracts
 
 
 def build_spread(symbol: str, direction: str, S: float, iv: float, expiry: dt.datetime,
-                 now: dt.datetime, equity: float, risk_pct: float = AGGR_TRADE_RISK_PCT
-                 ) -> Optional[Spread]:
+                 now: dt.datetime, equity: float, risk_pct: float = AGGR_TRADE_RISK_PCT,
+                 vix=None) -> Optional[Spread]:
     """Build an aggressively-sized, defined-risk debit spread in `direction`.
 
     Returns None (skip) if no width yields a positive debit that fits >=1 contract
-    within the risk budget -- never a naked or undefined-risk position.
+    within the risk budget -- never a naked or undefined-risk position. Each leg is
+    priced at its own surface IV when `vix` is given (short-DTE mode).
     """
     right = "C" if direction == "bull" else "P"
     q = config.DIVIDEND_YIELD.get(symbol, config.DEFAULT_DIVIDEND_YIELD)
@@ -163,8 +193,10 @@ def build_spread(symbol: str, direction: str, S: float, iv: float, expiry: dt.da
         short_k = long_k + w if direction == "bull" else long_k - w
         if short_k <= 0:
             continue
-        lp = bsm.bs_price(S, long_k, config.RISK_FREE_RATE, q, iv, T, right)
-        sp = bsm.bs_price(S, short_k, config.RISK_FREE_RATE, q, iv, T, right)
+        lp = bsm.bs_price(S, long_k, config.RISK_FREE_RATE, q,
+                          _leg_iv(symbol, S, long_k, vix, iv), T, right)
+        sp = bsm.bs_price(S, short_k, config.RISK_FREE_RATE, q,
+                          _leg_iv(symbol, S, short_k, vix, iv), T, right)
         debit = lp - sp
         if debit <= 0 or debit >= w:           # must be a real, defined-risk debit
             continue
@@ -313,7 +345,9 @@ def backtest(equity0: float = 100_000.0, interval: str = BAR_INTERVAL,
         iv_day = vix.get(day) or vix.get(max((d for d in vix if d <= day), default=day)) or 18.0
         day_start_eq = equity
         day_res = DayResult(day=day, start_equity=day_start_eq, end_equity=day_start_eq)
-        expiry = dt.datetime.combine(day, _MARKET_CLOSE_UTC, tzinfo=dt.timezone.utc)
+        eod = dt.datetime.combine(day, _MARKET_CLOSE_UTC, tzinfo=dt.timezone.utc)
+        expiry = dt.datetime.combine(day + dt.timedelta(days=INTRADAY_DTE),
+                                     _MARKET_CLOSE_UTC, tzinfo=dt.timezone.utc)
 
         bars = {s: by_day[s].get(day, []) for s in universe}
         ind = {s: _indicators([b.close for b in bars[s]], signal, sma_n) for s in universe}
@@ -331,7 +365,7 @@ def backtest(equity0: float = 100_000.0, interval: str = BAR_INTERVAL,
             mtm = 0.0
             for s, sp in open_pos.items():
                 if ts in idx[s]:
-                    mtm += sp.pnl(bars[s][idx[s][ts]].close, _iv(iv_day, s), ts)
+                    mtm += sp.pnl(bars[s][idx[s][ts]].close, _iv(iv_day, s), ts, vix=iv_day)
             curve.append((ts, day_start_eq + realized_day + mtm))
 
             for s in universe:
@@ -345,7 +379,7 @@ def backtest(equity0: float = 100_000.0, interval: str = BAR_INTERVAL,
 
                 if s in open_pos:
                     sp = open_pos[s]
-                    val = sp.value(bar.close, iv_s, ts)
+                    val = sp.value(bar.close, iv_s, ts, vix=iv_day)
                     reason = None
                     if _want_flip_exit(ind[s], i, sp.direction, signal, z_entry, z_exit):
                         reason = "signal_flip"
@@ -355,10 +389,10 @@ def backtest(equity0: float = 100_000.0, interval: str = BAR_INTERVAL,
                         reason = "target"
                     elif (i - open_entry_i[s]) >= max_hold_bars:
                         reason = "time"
-                    elif ts >= expiry - dt.timedelta(minutes=10):
+                    elif ts >= eod - dt.timedelta(minutes=10):
                         reason = "eod"
                     if reason:
-                        pnl = sp.pnl(bar.close, iv_s, ts)
+                        pnl = sp.pnl(bar.close, iv_s, ts, vix=iv_day)
                         realized_day += pnl
                         t = Trade(s, sp.direction, open_entry[s], ts, sp.contracts, sp.debit,
                                   sp.width, pnl, reason, sp.max_loss)
@@ -371,7 +405,7 @@ def backtest(equity0: float = 100_000.0, interval: str = BAR_INTERVAL,
                     halted = True
                 if halted or s in open_pos:
                     continue
-                if ts >= expiry - dt.timedelta(minutes=30):
+                if ts >= eod - dt.timedelta(minutes=30):
                     continue
                 if i < cooldown_until.get(s, -1):
                     continue
@@ -381,7 +415,7 @@ def backtest(equity0: float = 100_000.0, interval: str = BAR_INTERVAL,
                 eq_now = day_start_eq + realized_day
                 if sum(p.max_loss for p in open_pos.values()) >= MAX_CONCURRENT_RISK_PCT * eq_now:
                     continue
-                sp = build_spread(s, direction, bar.close, iv_s, expiry, ts, eq_now, risk_pct)
+                sp = build_spread(s, direction, bar.close, iv_s, expiry, ts, eq_now, risk_pct, vix=iv_day)
                 if sp is None:
                     continue
                 if sp.max_loss > risk_pct * eq_now + 1e-6:    # hard per-trade cap
@@ -399,4 +433,8 @@ def backtest(equity0: float = 100_000.0, interval: str = BAR_INTERVAL,
 
 
 def _iv(vix_level: float, symbol: str) -> float:
+    """0-DTE IV. Default 'competition' mode: flat ZERO_DTE_IV (how PentPort prices
+    same-day options). 'vix' mode: legacy VIX*factor (kept for comparison)."""
+    if IV_MODE == "competition":
+        return ZERO_DTE_IV
     return (vix_level / 100.0) * IV_FACTOR.get(symbol, 1.0)
