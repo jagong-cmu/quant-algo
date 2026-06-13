@@ -1,0 +1,13 @@
+# NEVER ship the real key or local cruft into the image
+.env
+.venv/
+logs/
+state/
+reports/
+.git/
+__pycache__/
+**/__pycache__/
+*.pyc
+tests/
+*.md
+deploy/

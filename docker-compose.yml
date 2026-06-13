@@ -1,0 +1,15 @@
+# Autonomous PentPort runner on a server you control.
+#   1) put your key in .env on the SERVER (PENTPORT_API_KEY=pp_live_...)
+#   2) docker compose up -d --build
+#   3) docker compose logs -f
+# Override to paper:  docker compose run --rm runner python autorun.py --daemon
+services:
+  runner:
+    build: .
+    container_name: quantalgo-runner
+    env_file: .env                 # server-side secret; gitignored, never committed
+    restart: unless-stopped        # auto-restart on crash/reboot
+    volumes:
+      - ./state:/app/state         # persist the position ledger across restarts
+      - ./logs:/app/logs           # persist logs
+    # default CMD (Dockerfile) is: python autorun.py --live --daemon
